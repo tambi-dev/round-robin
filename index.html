@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Round Robin — планирование CPU</title>
+  <style>
+    :root { color-scheme: light; --ink: #172437; --line: #d0d9e5; --blue: #1748a0; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #fff; color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+    main { width: min(100% - 32px, 760px); margin: 36px auto 64px; }
+    h1 { margin: 0; font-size: clamp(2rem, 6vw, 3rem); letter-spacing: -.04em; }
+    h2 { margin: 0 0 12px; font-size: 1.25rem; }
+    p { margin: 8px 0 16px; }
+    header, section { border-bottom: 1px solid var(--line); margin-bottom: 24px; padding-bottom: 20px; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; }
+    thead, tfoot { background: #f0f4fa; }
+    input, button { min-height: 42px; border: 1px solid #8796ab; border-radius: 5px; padding: 6px 10px; font: inherit; }
+    input { width: 100%; max-width: 116px; font-variant-numeric: tabular-nums; }
+    #quantum { margin-left: 8px; }
+    button { background: #fff; color: var(--ink); cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    button[type="submit"] { background: var(--blue); border-color: var(--blue); color: white; font-weight: 650; }
+    :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .scroll { overflow-x: auto; }
+    #error { color: #a12020; }
+    #error:empty { display: none; }
+    #timeline { display: flex; gap: 2px; list-style: none; margin: 0; padding: 0 0 8px; }
+    #timeline li { flex: var(--duration) 1 0; min-width: max-content; text-align: center; font-variant-numeric: tabular-nums; }
+    #timeline strong { display: block; background: #dbe8ff; color: #163b78; padding: 8px 4px; }
+    #timeline .idle strong { background: #eceff3; color: #424f5f; }
+    #timeline small { display: block; min-width: 62px; padding-inline: 3px; white-space: nowrap; margin-top: 5px; }
+    @media (max-width: 480px) {
+      #timeline small { min-width: 44px; font-size: .75rem; }
+      #result th, #result td { padding-inline: 6px; font-size: .875rem; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Round Robin</h1>
+      <p>Если процесс приходит в момент окончания кванта, он встаёт в очередь перед вытесненным процессом.</p>
+    </header>
+
+    <section aria-labelledby="input-title">
+      <h2 id="input-title">Входные данные</h2>
+      <form id="scheduler">
+        <p><label for="quantum">Квант времени</label><input id="quantum" type="number" min="1" step="1" value="2" required></p>
+        <div class="scroll">
+          <table>
+            <thead><tr><th scope="col">Процесс</th><th scope="col">Arrival</th><th scope="col">Burst</th><th scope="col">Действие</th></tr></thead>
+            <tbody id="processes"></tbody>
+          </table>
+        </div>
+        <div class="actions">
+          <button type="submit">Рассчитать</button>
+          <button id="add" type="button">Добавить процесс</button>
+        </div>
+        <p id="error" role="alert"></p>
+      </form>
+      <noscript>Включи JavaScript в браузере, чтобы выполнить расчёт.</noscript>
+    </section>
+
+    <div id="result" hidden>
+      <section aria-labelledby="chart-title">
+        <h2 id="chart-title">Диаграмма Ганта</h2>
+        <div class="scroll"><ol id="timeline" aria-label="Порядок выполнения процессов"></ol></div>
+      </section>
+      <section aria-labelledby="stats-title">
+        <h2 id="stats-title">Время для каждого процесса</h2>
+        <div class="scroll">
+          <table>
+            <thead><tr><th scope="col">Процесс</th><th scope="col">Completion</th><th scope="col">Waiting</th><th scope="col">Turnaround</th></tr></thead>
+            <tbody id="stats"></tbody>
+            <tfoot><tr><th scope="row" colspan="2">Среднее</th><td id="mean-waiting"></td><td id="mean-turnaround"></td></tr></tfoot>
+          </table>
+        </div>
+        <p>Turnaround = Completion − Arrival. Waiting = Turnaround − Burst.</p>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    // Моделирование очереди. Имена процессов и результаты не зависят от HTML.
+    function roundRobin(processes, quantum) {
+      const pending = processes.map(process => ({ ...process, remaining: process.burst }));
+      pending.sort((a, b) => a.arrival - b.arrival);
+      const ready = [];
+      const timeline = [];
+      const completion = new Map();
+      let next = 0;
+      let time = 0;
+
+      function enqueueArrivals() {
+        while (next < pending.length && pending[next].arrival <= time) {
+          ready.push(pending[next++]);
+        }
+      }
+
+      while (completion.size < processes.length) {
+        enqueueArrivals();
+        if (ready.length === 0) {
+          const arrival = pending[next].arrival;
+          timeline.push({ name: 'Простой', start: time, end: arrival, idle: true });
+          time = arrival;
+          enqueueArrivals();
+        }
+
+        const process = ready.shift();
+        const duration = Math.min(quantum, process.remaining);
+        timeline.push({ name: process.name, start: time, end: time + duration });
+        time += duration;
+        process.remaining -= duration;
+
+        // Сначала добавляем всех прибывших, включая прибытия ровно в конце кванта.
+        enqueueArrivals();
+        if (process.remaining > 0) {
+          ready.push(process);
+        } else {
+          completion.set(process.name, time);
+        }
+      }
+
+      const stats = processes.map(({ name, arrival, burst }) => {
+        const end = completion.get(name);
+        const turnaround = end - arrival;
+        return { name, end, waiting: turnaround - burst, turnaround };
+      });
+      return { timeline, stats };
+    }
+
+    const form = document.querySelector('#scheduler');
+    const quantumInput = document.querySelector('#quantum');
+    const processRows = document.querySelector('#processes');
+    const error = document.querySelector('#error');
+    const result = document.querySelector('#result');
+    const timelineList = document.querySelector('#timeline');
+    const statsRows = document.querySelector('#stats');
+    const formatMean = new Intl.NumberFormat('ru', { maximumFractionDigits: 2 });
+    let nextId = 1;
+
+    function clearResult() {
+      result.hidden = true;
+      error.textContent = '';
+    }
+
+    function updateRemoveButtons() {
+      for (const button of processRows.querySelectorAll('button')) {
+        button.disabled = processRows.rows.length === 1;
+      }
+    }
+
+    function addProcess(arrival = '', burst = '') {
+      const name = 'P' + nextId++;
+      const row = processRows.insertRow();
+      row.dataset.name = name;
+      row.innerHTML = `
+        <th scope="row">${name}</th>
+        <td><input class="arrival" type="number" min="0" step="1" value="${arrival}" aria-label="${name} Arrival" required></td>
+        <td><input class="burst" type="number" min="1" step="1" value="${burst}" aria-label="${name} Burst" required></td>
+        <td><button type="button" aria-label="Удалить ${name}">Удалить</button></td>`;
+      row.querySelector('button').addEventListener('click', () => {
+        row.remove();
+        updateRemoveButtons();
+        clearResult();
+      });
+      updateRemoveButtons();
+      return row.querySelector('.arrival');
+    }
+
+    function calculate() {
+      const quantum = quantumInput.valueAsNumber;
+      const processes = Array.from(processRows.rows, row => ({
+        name: row.dataset.name,
+        arrival: row.querySelector('.arrival').valueAsNumber,
+        burst: row.querySelector('.burst').valueAsNumber
+      }));
+      const maxArrival = processes.reduce((max, process) => Math.max(max, process.arrival), 0);
+      const totalBurst = processes.reduce((sum, process) => sum + process.burst, 0);
+      const sliceCount = processes.reduce((sum, process) => sum + Math.ceil(process.burst / quantum), 0);
+      if (!Number.isSafeInteger(quantum) || !Number.isSafeInteger(maxArrival + totalBurst)) {
+        error.textContent = 'Введи меньшие целые числа.';
+        return;
+      }
+      if (sliceCount > 1000) {
+        error.textContent = 'В диаграмме будет больше 1000 отрезков. Увеличь квант или сократи Burst.';
+        return;
+      }
+
+      const { timeline, stats } = roundRobin(processes, quantum);
+      timelineList.replaceChildren();
+      for (const { name, start, end, idle } of timeline) {
+        const item = document.createElement('li');
+        item.classList.toggle('idle', Boolean(idle));
+        item.style.setProperty('--duration', end - start);
+        const label = document.createElement('strong');
+        label.textContent = name;
+        const range = document.createElement('small');
+        range.textContent = start + '–' + end;
+        item.append(label, range);
+        timelineList.append(item);
+      }
+
+      statsRows.replaceChildren();
+      for (const { name, end, waiting, turnaround } of stats) {
+        const row = statsRows.insertRow();
+        const heading = document.createElement('th');
+        heading.scope = 'row';
+        heading.textContent = name;
+        row.append(heading);
+        for (const value of [end, waiting, turnaround]) {
+          row.insertCell().textContent = value;
+        }
+      }
+      const mean = field => formatMean.format(stats.reduce((sum, row) => sum + row[field], 0) / stats.length);
+      document.querySelector('#mean-waiting').textContent = mean('waiting');
+      document.querySelector('#mean-turnaround').textContent = mean('turnaround');
+      result.hidden = false;
+    }
+
+    form.addEventListener('input', clearResult);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      clearResult();
+      calculate();
+    });
+    document.querySelector('#add').addEventListener('click', () => {
+      clearResult();
+      addProcess().focus();
+    });
+
+    for (const [arrival, burst] of [[0, 5], [1, 3], [2, 1], [3, 2]]) {
+      addProcess(arrival, burst);
+    }
+    calculate();
+  </script>
+</body>
+</html>
